@@ -1,9 +1,11 @@
-use dashmap::DashMap;
-use serde_json::{Value, json};
+use std::env;
 use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
+use dashmap::DashMap;
+use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Instant;
 
 fn calculate_median(mut values: Vec<f64>) -> f64 {
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -16,38 +18,54 @@ fn calculate_median(mut values: Vec<f64>) -> f64 {
 }
 
 fn main() -> io::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    let debug = args.contains(&"--debug".to_string());
+
+    let debug_print = |message: &str| {
+        if debug {
+            println!("{}", message);
+        }
+    };
+
+    let start = Instant::now();
+    debug_print(&format!("Start time: {:?}", start));
+
     let file_path = "data/weather_stations.csv";
+
+    let before_open = Instant::now();
+    debug_print(&format!("Time before opening the file: {:?}", before_open));
+
+    let lines = match read_lines(file_path) {
+        Ok(lines) => lines,
+        Err(e) => {
+            println!("Failed to open file: {}", e);
+            return Err(e);
+        }
+    };
+
+    let after_open = Instant::now();
+    debug_print(&format!("Time after opening the file: {:?}", after_open));
 
     let weather_map = Arc::new(DashMap::new());
 
-    if let Ok(lines) = read_lines(file_path) {
-        for (line_number, line) in lines.flatten().enumerate() {
-            println!("Reading line {}: {}", line_number + 1, line);
+    for (line_number, line) in lines.flatten().enumerate() {
+        debug_print(&format!("Reading line {}: {}", line_number + 1, line));
 
-            if line.starts_with('#') || line.trim().is_empty() {
-                println!("Skipping line {}: {}", line_number + 1, line);
-                continue;
-            }
-
-            if let Some((city, temp)) = parse_line(&line) {
-                println!(
-                    "Parsed line {}: City = {}, Temp = {}",
-                    line_number + 1,
-                    city,
-                    temp
-                );
-                weather_map.entry(city).or_insert_with(Vec::new).push(temp);
-            } else {
-                println!("Failed to parse line {}: {}", line_number + 1, line);
-            }
+        if line.starts_with('#') || line.trim().is_empty() {
+            debug_print(&format!("Skipping line {}: {}", line_number + 1, line));
+            continue;
         }
-    } else {
-        println!("Failed to open file: {}", file_path);
+
+        if let Some((city, temp)) = parse_line(&line) {
+            debug_print(&format!("Parsed line {}: City = {}, Temp = {}", line_number + 1, city, temp));
+            weather_map.entry(city).or_insert_with(Vec::new).push(temp);
+        } else {
+            debug_print(&format!("Failed to parse line {}: {}", line_number + 1, line));
+        }
     }
 
-    if weather_map.is_empty() {
-        println!("No data was parsed into the map!");
-    }
+    let after_map = Instant::now();
+    debug_print(&format!("Time after mapping the file: {:?}", after_map));
 
     let mut result = serde_json::Map::new();
 
@@ -73,8 +91,11 @@ fn main() -> io::Result<()> {
     if let Err(e) = std::fs::write(output_path, serde_json::to_string_pretty(&json_output)?) {
         println!("Failed to write to file: {}", e);
     } else {
-        println!("Output written to {}", output_path);
+        let after_write = Instant::now();
+        debug_print(&format!("Time after completing the write to disk: {:?}", after_write));
     }
+
+    println!("Total execution time: {:?}", start.elapsed());
 
     Ok(())
 }

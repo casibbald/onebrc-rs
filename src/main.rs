@@ -1,12 +1,11 @@
 use dashmap::DashMap;
-use generator::{Generator, Gn, done};
-use rayon::ThreadPoolBuilder;
-use rayon::iter::ParallelIterator;
-use rayon::prelude::IntoParallelIterator;
-use serde_json::{Value, json};
+use generator::{done, Generator, Gn};
+use memmap2::Mmap;
+use rayon::prelude::*;
+use serde_json::{json, Value};
 use std::env;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+use std::io;
 use std::time::Instant;
 
 fn calculate_mean(values: &[f64]) -> f64 {
@@ -19,40 +18,35 @@ fn calculate_mean(values: &[f64]) -> f64 {
     }
 }
 
-fn chunk_lines(file_path: &str, start: u64, end: u64) -> Generator<'_, (), String> {
+fn chunk_lines(mmap: &[u8], start: usize, end: usize) -> Generator<'_, (), String> {
     Gn::new_scoped(move |mut s| {
-        let file = File::open(file_path).expect("Failed to open file");
-        let mut reader = BufReader::new(file);
-
-        // Seek to the start of the chunk
-        reader.seek(SeekFrom::Start(start)).expect("Failed to seek");
-
-        // Skip partial line at the start of the chunk
-        if start > 0 {
-            let mut temp_buf = Vec::new();
-            reader.read_until(b'\n', &mut temp_buf).unwrap();
-        }
-
-        let mut buffer = String::new();
         let mut current_pos = start;
 
-        // Process lines within the chunk
+        if start > 0 {
+            while current_pos < end && mmap[current_pos] != b'\n' {
+                current_pos += 1;
+            }
+            current_pos += 1;
+        }
+
         while current_pos < end {
-            if reader.read_line(&mut buffer).unwrap() == 0 {
-                break;
+            let line_start = current_pos;
+            while current_pos < end && mmap[current_pos] != b'\n' {
+                current_pos += 1;
             }
 
-            s.yield_with(buffer.clone()); // Yield the line
+            let line = String::from_utf8_lossy(&mmap[line_start..current_pos]).to_string();
+            s.yield_with(line);
 
-            current_pos = reader.stream_position().unwrap();
+            current_pos += 1;
         }
         done!()
     })
 }
 
-fn process_chunk(file_path: &str, start: u64, end: u64) -> DashMap<String, Vec<f64>> {
+fn process_chunk(mmap: &[u8], start: usize, end: usize) -> DashMap<String, Vec<f64>> {
     let map = DashMap::new();
-    let lines = chunk_lines(file_path, start, end);
+    let lines = chunk_lines(mmap, start, end);
 
     for line in lines.into_iter() {
         if let Some((city, temp)) = parse_line(&line) {
@@ -77,24 +71,19 @@ fn reduce_results(combined_map: &DashMap<String, Vec<f64>>) -> Generator<(), (St
                 s.yield_with((city, json!({ "Min": min, "Mean": mean, "Max": max })));
             }
         }
-        done!(); // Indicate the generator has completed.
+        done!();
     })
 }
-
-
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     let debug = args.contains(&"--debug".to_string());
-    let file_path = args.iter().find(|arg| arg.starts_with("--file=")).map_or(
-        "data/measurements.txt".to_string(),
-        |arg| {
-            arg.split('=')
-                .nth(1)
-                .unwrap_or("data/measurements.txt")
-                .to_string()
-        },
-    );
+    let file_path = args
+        .iter()
+        .find(|arg| arg.starts_with("--file="))
+        .map_or("data/measurements.txt".to_string(), |arg| {
+            arg.split('=').nth(1).unwrap_or("data/measurements.txt").to_string()
+        });
 
     let debug_print = |message: &str| {
         if debug {
@@ -102,38 +91,33 @@ fn main() -> io::Result<()> {
         }
     };
 
+
+    let file = File::open(&file_path)?;
+    let file_size = file.metadata()?.len() as usize;
+
+    let mmap = unsafe { Mmap::map(&file)? };
+
     let start = Instant::now();
     debug_print(&format!("Start time: {:?}", start));
 
-    let file = File::open(&file_path)?;
-    let file_size = file.metadata()?.len();
-
-    let high_performance_cores = 8; // Adjust based on your Mac's configuration
-    let thread_pool = ThreadPoolBuilder::new()
-        .num_threads(high_performance_cores)
-        .build_global();
-    if thread_pool.is_err() {
-        eprintln!("Failed to set the rayon thread pool size.");
-    }
-
-    let num_cpus = high_performance_cores as u64;
-    let chunk_size = file_size / num_cpus;
+    let high_performance_cores = 8;
+    let chunk_size = file_size / high_performance_cores;
 
     debug_print(&format!("File size: {} bytes", file_size));
-    debug_print(&format!("Number of processors: {}", num_cpus));
+    debug_print(&format!("Number of processors: {}", high_performance_cores));
     debug_print(&format!("Chunk size: {} bytes", chunk_size));
 
     // Process file in parallel chunks
-    let results: Vec<_> = (0..num_cpus)
+    let results: Vec<_> = (0..high_performance_cores)
         .into_par_iter()
         .map(|i| {
             let start = i * chunk_size;
-            let end = if i == num_cpus - 1 {
+            let end = if i == high_performance_cores - 1 {
                 file_size
             } else {
-                (i + 1) * chunk_size - 1
+                (i + 1) * chunk_size
             };
-            process_chunk(&file_path, start, end)
+            process_chunk(&mmap, start, end)
         })
         .collect();
 
@@ -167,7 +151,6 @@ fn main() -> io::Result<()> {
         start.elapsed()
     );
 
-    // Write results to disk
     std::fs::write(
         output_path,
         serde_json::to_string_pretty(&json_output).unwrap(),

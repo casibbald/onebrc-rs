@@ -29,3 +29,10 @@ Total execution time: 386.078361042s
 ```bash
 Total execution time: 265.518331958s
 ```
+
+### Results after correctly detecting 10 CPU's
+```bash
+Total execution time: 187.897885666s
+```
+
+

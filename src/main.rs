@@ -22,7 +22,6 @@ fn calculate_median(values: &[f64]) -> f64 {
 }
 
 fn main() {
-    // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
     let debug = args.contains(&"--debug".to_string());
     let file_path = args.iter().find(|arg| arg.starts_with("--file=")).map_or(
@@ -30,7 +29,6 @@ fn main() {
         |arg| arg.split('=').nth(1).unwrap_or("data/weather_stations.csv").to_string(),
     );
 
-    // Function to print debug information
     let debug_print = |message: &str| {
         if debug {
             println!("{}", message);
@@ -40,14 +38,12 @@ fn main() {
     let start = Instant::now();
     debug_print(&format!("Start time: {:?}", start));
 
-    // Time before reading the file
     let before_open = Instant::now();
     debug_print(&format!(
         "Time before reading the file: {:?}",
         before_open
     ));
 
-    // Read entire file into memory
     let file_content = match fs::read_to_string(&file_path) {
         Ok(content) => content,
         Err(e) => {
@@ -56,26 +52,21 @@ fn main() {
         }
     };
 
-    // Time after reading the file
     let after_read = Instant::now();
     debug_print(&format!("Time after reading the file: {:?}", after_read));
 
-    // Split content into lines
     let lines = file_content.lines();
 
-    // Create a concurrent hash map to store city -> Vec<f64> (temperatures)
     let weather_map = Arc::new(DashMap::new());
 
     for (line_number, line) in lines.enumerate() {
         debug_print(&format!("Processing line {}: {}", line_number + 1, line));
 
-        // Skip comments or empty lines
         if line.starts_with('#') || line.trim().is_empty() {
             debug_print(&format!("Skipping line {}: {}", line_number + 1, line));
             continue;
         }
 
-        // Parse the line
         if let Some((city, temp)) = parse_line(line) {
             debug_print(&format!(
                 "Parsed line {}: City = {}, Temp = {}",
@@ -89,11 +80,9 @@ fn main() {
         }
     }
 
-    // Time after processing lines
     let after_parse = Instant::now();
     debug_print(&format!("Time after processing lines: {:?}", after_parse));
 
-    // Map-reduce: Calculate Min, Median, Max for each city
     let mut result = serde_json::Map::new();
 
     for entry in weather_map.iter() {
@@ -112,15 +101,12 @@ fn main() {
         }
     }
 
-    // Serialize the result as JSON
     let json_output = Value::Object(result);
     let output_path = "weather_stations.json";
 
-    // Write JSON output to file
     if let Err(e) = fs::write(output_path, serde_json::to_string_pretty(&json_output).unwrap()) {
         println!("Failed to write to file: {}", e);
     } else {
-        // Time after completing the write to disk
         let after_write = Instant::now();
         debug_print(&format!(
             "Time after completing the write to disk: {:?}",

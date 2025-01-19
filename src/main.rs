@@ -102,18 +102,18 @@ fn main() -> io::Result<()> {
     let start = Instant::now();
     debug_print(&format!("Start time: {:?}", start));
 
-    let high_performance_cores = 8;
-    let chunk_size = file_size / high_performance_cores;
+    let num_cpus = num_cpus::get_physical();
+    let chunk_size = file_size / num_cpus;
 
     debug_print(&format!("File size: {} bytes", file_size));
-    debug_print(&format!("Number of processors: {}", high_performance_cores));
+    debug_print(&format!("Number of processors: {}", num_cpus));
     debug_print(&format!("Chunk size: {} bytes", chunk_size));
 
-    let results: Vec<_> = (0..high_performance_cores)
+    let results: Vec<_> = (0..num_cpus)
         .into_par_iter()
         .map(|i| {
             let start = i * chunk_size;
-            let end = if i == high_performance_cores - 1 {
+            let end = if i == num_cpus - 1 {
                 file_size
             } else {
                 (i + 1) * chunk_size

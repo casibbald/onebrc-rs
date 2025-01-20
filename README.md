@@ -136,29 +136,31 @@ sudo apt-get install python3 python3-pip
 
 To install Python using Chocolatey, follow these steps:
 
-1. First, ensure you have Chocolatey installed. If not, you can install it by running the following command in an elevated (Administrator) PowerShell:
+#### First, ensure you have Chocolatey installed. If not, you can install it by running the following command in an elevated (Administrator) PowerShell:
 
-    ```powershell
-    Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = \
-    [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex \
-    ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-    ```
+ ```powershell
+ Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = \
+ [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex \
+ ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+ ```
 
-2. Once Chocolatey is installed, you can install Python by running:
+#### Once Chocolatey is installed, you can install Python by running:
 
-    ```powershell
-    choco install python
-    ```
+ ```powershell
+ choco install python make rustup.install
+ rustup default nightly
+ ```
 
-3. Verify the installation by checking the Python version:
+#### Verify the installation by checking the Python version:
 
-    ```powershell
-    python --version
-    ```
+ ```powershell
+ python --version
+ ```
 
 ### Generating real data
 
 Setting up all dependencies for generation tools.
+
 ```bash
 cd data/
 pip install -r hack/requirements.txt

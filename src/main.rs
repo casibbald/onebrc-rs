@@ -28,8 +28,6 @@ fn read_lines(file_path: String) -> Generator<'static, (), String> {
     })
 }
 
-
-
 fn parse_lines(
     input: Generator<'static, (), String>,
 ) -> Generator<'static, (), (String, f64)> {
@@ -89,13 +87,10 @@ fn main() -> io::Result<()> {
     let timer = Instant::now();
     let combined_map = Arc::new(DashMap::new());
 
-    // Stage 1: Read lines
     let lines = read_lines(file_path);
 
-    // Stage 2: Parse lines
     let parsed_lines = parse_lines(lines);
 
-    // Stage 3: Aggregate data
     aggregate_data(parsed_lines, combined_map.clone());
 
     println!(
@@ -103,7 +98,6 @@ fn main() -> io::Result<()> {
         timer.elapsed()
     );
 
-    // Stage 4: Reduce results
     let output = reduce_results_to_string(&combined_map);
     let output_path = "weather_stations.txt";
 
@@ -116,9 +110,6 @@ fn main() -> io::Result<()> {
 
     Ok(())
 }
-
-
-
 
 fn parse_line(line: &str) -> Option<(String, f64)> {
     let parts: Vec<&str> = line.split(';').collect();

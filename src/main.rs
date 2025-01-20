@@ -2,7 +2,6 @@ use dashmap::DashMap;
 use generator::{Generator, Gn, done};
 use memmap2::Mmap;
 use rayon::prelude::*;
-use serde_json::{Value, json};
 use std::env;
 use std::fs::File;
 use std::io;
@@ -57,22 +56,22 @@ fn process_chunk(mmap: &[u8], start: usize, end: usize) -> DashMap<String, Vec<f
     map
 }
 
-fn reduce_results(combined_map: &DashMap<String, Vec<f64>>) -> Generator<(), (String, Value)> {
-    Gn::new_scoped(move |mut s| {
-        for entry in combined_map.iter() {
-            let city = entry.key().clone();
-            let temps = entry.value().clone();
+fn reduce_results_to_string(combined_map: &DashMap<String, Vec<f64>>) -> String {
+    let mut results = Vec::new();
+    for entry in combined_map.iter() {
+        let city = entry.key();
+        let temps = entry.value();
 
-            if !temps.is_empty() {
-                let min = temps.iter().cloned().fold(f64::INFINITY, f64::min);
-                let max = temps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let mean = calculate_mean(&temps);
+        if !temps.is_empty() {
+            let min = temps.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = temps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let mean = calculate_mean(temps);
 
-                s.yield_with((city, json!({ "Min": min, "Mean": mean, "Max": max })));
-            }
+            results.push(format!("{city}={:.1}/{:.1}/{:.1}", min, mean, max));
         }
-        done!();
-    })
+    }
+    results.sort();
+    format!("{{{}}}", results.join(", "))
 }
 
 fn main() -> io::Result<()> {
@@ -99,8 +98,8 @@ fn main() -> io::Result<()> {
 
     let mmap = unsafe { Mmap::map(&file)? };
 
-    let start = Instant::now();
-    debug_print(&format!("Start time: {:?}", start));
+    let timer = Instant::now();
+    debug_print(&format!("Start time: {:?}", timer));
 
     let num_cpus = num_cpus::get_physical();
     let chunk_size = file_size / num_cpus;
@@ -135,25 +134,15 @@ fn main() -> io::Result<()> {
     let after_processing = Instant::now();
     debug_print(&format!("Time after processing: {:?}", after_processing));
 
-    let mut result = serde_json::Map::new();
-    let mut generator = reduce_results(&combined_map);
+    let output = reduce_results_to_string(&combined_map);
 
-    while let Some((city, stats)) = generator.resume() {
-        result.insert(city, stats);
-    }
-
-    let json_output = Value::Object(result);
-    let output_path = "weather_stations.json";
-
+    let output_path = "weather_stations.txt";
     println!(
         "Total execution time (before writing to disk): {:?}",
-        start.elapsed()
+        timer.elapsed()
     );
 
-    std::fs::write(
-        output_path,
-        serde_json::to_string_pretty(&json_output).unwrap(),
-    )?;
+    std::fs::write(output_path, output)?;
 
     Ok(())
 }

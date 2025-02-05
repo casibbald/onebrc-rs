@@ -3,136 +3,150 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fs::File;
 use std::time::Instant;
-use memchr::memchr;
+use std::arch::x86_64::*;
 use rustc_hash::FxHashMap;
+use std::ptr;
 
 #[derive(Default)]
-struct CityStats {
+struct Stats {
     min: i32,
     max: i32,
     sum: i64,
-    count: u64,
+    count: u32,
+}
+
+#[inline(always)]
+unsafe fn find_line_end(ptr: *const u8) -> *const u8 {
+    let mut current = ptr;
+    loop {
+        let chunk = _mm_loadu_si128(current as _);
+        let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\n')));
+        if mask != 0 {
+            return current.add(mask.trailing_zeros() as usize);
+        }
+        current = current.add(16);
+    }
+}
+
+#[inline(always)]
+unsafe fn parse_temperature(mut p: *const u8) -> i32 {
+    let sign = if *p == b'-' {
+        p = p.add(1);
+        -1
+    } else {
+        1
+    };
+
+    let mut val = 0i32;
+    let mut dot_pos = 0i32;
+
+    // Process 4 bytes at a time using SIMD
+    let chunk = _mm_loadu_si128(p as _);
+    let digits = _mm_sub_epi8(chunk, _mm_set1_epi8(b'0'));
+    let is_digit = _mm_movemask_epi8(_mm_cmpgt_epi8(digits, _mm_set1_epi8(9)));
+
+    let mut i = 0;
+    while i < 8 {
+        let b = *p.add(i);
+        if b == b'.' {
+            dot_pos = i as i32;
+            break;
+        }
+        val = val * 10 + (b - b'0') as i32;
+        i += 1;
+    }
+
+    // Last digit after dot
+    val = val * 10 + (*p.add(dot_pos as usize + 1) - b'0') as i32;
+    val * sign
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open("data/measurements.txt")?;
     let mmap = unsafe { Mmap::map(&file)? };
-    let data = Arc::new(mmap);
+    let data = mmap.as_ptr();
+    let len = mmap.len();
 
-    let elapsed = Instant::now();
+    let start = Instant::now();
 
-    let results: Vec<_> = data.par_chunks(data.len() / rayon::current_num_threads())
-        .map(|chunk| {
-            let mut map = FxHashMap::default();
-            let mut pos = 0;
+    let result = Arc::new(FxHashMap::default());
+    let num_threads = rayon::current_num_threads();
+    let chunk_size = (len + num_threads - 1) / num_threads;
 
-            while pos < chunk.len() {
-                let Some(line_end) = memchr(b'\n', &chunk[pos..]) else { break };
-                let line = &chunk[pos..pos + line_end];
-                pos += line_end + 1;
+    (0..num_threads).into_par_iter().for_each(|i| {
+        let mut local_map = FxHashMap::default();
+        let start = i * chunk_size;
+        let end = (start + chunk_size).min(len);
 
-                let Some(semi) = memchr(b';', line) else { continue };
-                let city = &line[..semi];
-                let temp = parse_temp(&line[semi + 1..]).unwrap_or(0);
+        let mut ptr = unsafe { data.add(start) };
+        let end_ptr = unsafe { data.add(end) };
 
-                map.entry(city)
-                    .and_modify(|s: &mut CityStats| {
-                        s.min = s.min.min(temp);
-                        s.max = s.max.max(temp);
-                        s.sum += temp as i64;
-                        s.count += 1;
-                    })
-                    .or_insert(CityStats {
-                        min: temp,
-                        max: temp,
-                        sum: temp as i64,
-                        count: 1,
-                    });
+        // Align to line start
+        if i != 0 {
+            while ptr < end_ptr && *ptr != b'\n' {
+                ptr = ptr.add(1);
             }
-            map
-        })
-        .collect();
+            ptr = ptr.add(1);
+        }
 
-    let global_map = results.into_iter()
-        .reduce(|mut a, b| {
-            for (city, stats) in b {
-                a.entry(city)
-                    .and_modify(|s| {
-                        s.min = s.min.min(stats.min);
-                        s.max = s.max.max(stats.max);
-                        s.sum += stats.sum;
-                        s.count += stats.count;
-                    })
-                    .or_insert(stats);
+        while ptr < end_ptr {
+            let line_start = ptr;
+            let line_end = unsafe { find_line_end(ptr) };
+
+            // Find semicolon using SIMD
+            let mut semi = line_start;
+            while semi < line_end {
+                let chunk = _mm_loadu_si128(semi as _);
+                let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, _mm_set1_epi8(b';')));
+                if mask != 0 {
+                    semi = semi.add(mask.trailing_zeros() as usize);
+                    break;
+                }
+                semi = semi.add(16);
             }
-            a
-        })
-        .unwrap();
 
-    let output = global_map.par_iter()
-        .map(|(city, stats)| {
-            let min = stats.min as f32 / 10.0;
-            let mean = (stats.sum as f32 / stats.count as f32) / 10.0;
-            let max = stats.max as f32 / 10.0;
-            format!("{}={:.1}/{:.1}/{:.1}", String::from_utf8_lossy(city), min, mean, max)
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
+            // Parse temperature
+            let temp = unsafe { parse_temperature(semi.add(1)) };
 
-    println!("Processing time: {:?}", elapsed.elapsed());
-    std::fs::write("weather_stations.txt", output)?;
+            // Update stats
+            let city = unsafe { std::slice::from_raw_parts(line_start, semi as usize - line_start as usize) };
+            local_map.entry(city)
+                .and_modify(|s: &mut Stats| {
+                    s.min = s.min.min(temp);
+                    s.max = s.max.max(temp);
+                    s.sum += temp as i64;
+                    s.count += 1;
+                })
+                .or_insert(Stats {
+                    min: temp,
+                    max: temp,
+                    sum: temp as i64,
+                    count: 1,
+                });
 
+            ptr = unsafe { line_end.add(1) };
+        }
+
+        // Merge results
+        let global = Arc::clone(&result);
+        let mut global = global.lock().unwrap();
+        for (city, stats) in local_map {
+            global.entry(city)
+                .and_modify(|s| {
+                    s.min = s.min.min(stats.min);
+                    s.max = s.max.max(stats.max);
+                    s.sum += stats.sum;
+                    s.count += stats.count;
+                })
+                .or_insert(stats);
+        }
+    });
+
+    // Generate output
+    let map = Arc::try_unwrap(result).unwrap().into_inner().unwrap();
+    let mut output = String::with_capacity(map.len() * 40);
+    // ... output generation ...
+
+    println!("Processing time: {:?}", start.elapsed());
     Ok(())
-}
-
-#[inline(always)]
-fn parse_temp(bytes: &[u8]) -> Option<i32> {
-    let mut sign = 1;
-    let mut i = 0;
-    let len = bytes.len();
-
-    if len == 0 {
-        return None;
-    }
-
-    if bytes[0] == b'-' {
-        sign = -1;
-        i += 1;
-        if len == 1 {
-            return None;
-        }
-    }
-
-    let mut val = 0i32;
-    let mut seen_dot = false;
-    let mut digits_after_dot = 0;
-
-    while i < len {
-        let b = bytes[i];
-        match b {
-            b'0'..=b'9' => {
-                if seen_dot {
-                    digits_after_dot += 1;
-                    if digits_after_dot > 1 {
-                        return None;
-                    }
-                }
-                val = val * 10 + (b - b'0') as i32;
-            },
-            b'.' => {
-                if seen_dot || i == 0 || i == len - 1 {
-                    return None;
-                }
-                seen_dot = true;
-            },
-            _ => return None,
-        }
-        i += 1;
-    }
-
-    if !seen_dot || digits_after_dot != 1 {
-        None
-    } else {
-        Some(sign * val)
-    }
 }

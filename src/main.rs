@@ -1,170 +1,138 @@
-use dashmap::DashMap;
-use generator::{Generator, Gn, done};
+use std::sync::Arc;
 use memmap2::Mmap;
 use rayon::prelude::*;
-use serde_json::{Value, json};
-use std::env;
 use std::fs::File;
-use std::io;
 use std::time::Instant;
+use memchr::memchr;
+use rustc_hash::FxHashMap;
 
-fn calculate_mean(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        0.0
-    } else {
-        let sum: f64 = values.iter().sum();
-        let mean = sum / values.len() as f64;
-        (mean * 10.0).ceil() / 10.0
-    }
+#[derive(Default)]
+struct CityStats {
+    min: i32,
+    max: i32,
+    sum: i64,
+    count: u64,
 }
 
-fn chunk_lines(mmap: &[u8], start: usize, end: usize) -> Generator<'_, (), String> {
-    Gn::new_scoped(move |mut s| {
-        let mut current_pos = start;
-
-        if start > 0 {
-            while current_pos < end && mmap[current_pos] != b'\n' {
-                current_pos += 1;
-            }
-            current_pos += 1;
-        }
-
-        while current_pos < end {
-            let line_start = current_pos;
-            while current_pos < end && mmap[current_pos] != b'\n' {
-                current_pos += 1;
-            }
-
-            let line = String::from_utf8_lossy(&mmap[line_start..current_pos]).to_string();
-            s.yield_with(line);
-
-            current_pos += 1;
-        }
-        done!()
-    })
-}
-
-fn process_chunk(mmap: &[u8], start: usize, end: usize) -> DashMap<String, Vec<f64>> {
-    let map = DashMap::new();
-    let lines = chunk_lines(mmap, start, end);
-
-    for line in lines.into_iter() {
-        if let Some((city, temp)) = parse_line(&line) {
-            map.entry(city).or_insert_with(Vec::new).push(temp);
-        }
-    }
-
-    map
-}
-
-fn reduce_results(combined_map: &DashMap<String, Vec<f64>>) -> Generator<(), (String, Value)> {
-    Gn::new_scoped(move |mut s| {
-        for entry in combined_map.iter() {
-            let city = entry.key().clone();
-            let temps = entry.value().clone();
-
-            if !temps.is_empty() {
-                let min = temps.iter().cloned().fold(f64::INFINITY, f64::min);
-                let max = temps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let mean = calculate_mean(&temps);
-
-                s.yield_with((city, json!({ "Min": min, "Mean": mean, "Max": max })));
-            }
-        }
-        done!();
-    })
-}
-
-fn main() -> io::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    let debug = args.contains(&"--debug".to_string());
-    let file_path = args.iter().find(|arg| arg.starts_with("--file=")).map_or(
-        "data/measurements.txt".to_string(),
-        |arg| {
-            arg.split('=')
-                .nth(1)
-                .unwrap_or("data/measurements.txt")
-                .to_string()
-        },
-    );
-
-    let debug_print = |message: &str| {
-        if debug {
-            println!("{}", message);
-        }
-    };
-
-    let file = File::open(&file_path)?;
-    let file_size = file.metadata()?.len() as usize;
-
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::open("data/measurements.txt")?;
     let mmap = unsafe { Mmap::map(&file)? };
+    let data = Arc::new(mmap);
 
-    let start = Instant::now();
-    debug_print(&format!("Start time: {:?}", start));
+    let elapsed = Instant::now();
 
-    let num_cpus = num_cpus::get_physical();
-    let chunk_size = file_size / num_cpus;
+    let results: Vec<_> = data.par_chunks(data.len() / rayon::current_num_threads())
+        .map(|chunk| {
+            let mut map = FxHashMap::default();
+            let mut pos = 0;
 
-    debug_print(&format!("File size: {} bytes", file_size));
-    debug_print(&format!("Number of processors: {}", num_cpus));
-    debug_print(&format!("Chunk size: {} bytes", chunk_size));
+            while pos < chunk.len() {
+                let Some(line_end) = memchr(b'\n', &chunk[pos..]) else { break };
+                let line = &chunk[pos..pos + line_end];
+                pos += line_end + 1;
 
-    let results: Vec<_> = (0..num_cpus)
-        .into_par_iter()
-        .map(|i| {
-            let start = i * chunk_size;
-            let end = if i == num_cpus - 1 {
-                file_size
-            } else {
-                (i + 1) * chunk_size
-            };
-            process_chunk(&mmap, start, end)
+                let Some(semi) = memchr(b';', line) else { continue };
+                let city = &line[..semi];
+                let temp = parse_temp(&line[semi + 1..]).unwrap_or(0);
+
+                map.entry(city)
+                    .and_modify(|s: &mut CityStats| {
+                        s.min = s.min.min(temp);
+                        s.max = s.max.max(temp);
+                        s.sum += temp as i64;
+                        s.count += 1;
+                    })
+                    .or_insert(CityStats {
+                        min: temp,
+                        max: temp,
+                        sum: temp as i64,
+                        count: 1,
+                    });
+            }
+            map
         })
         .collect();
 
-    let combined_map = DashMap::new();
-    for map in results {
-        for entry in map.iter() {
-            combined_map
-                .entry(entry.key().clone())
-                .or_insert_with(Vec::new)
-                .extend(entry.value().clone());
-        }
-    }
+    let global_map = results.into_iter()
+        .reduce(|mut a, b| {
+            for (city, stats) in b {
+                a.entry(city)
+                    .and_modify(|s| {
+                        s.min = s.min.min(stats.min);
+                        s.max = s.max.max(stats.max);
+                        s.sum += stats.sum;
+                        s.count += stats.count;
+                    })
+                    .or_insert(stats);
+            }
+            a
+        })
+        .unwrap();
 
-    let after_processing = Instant::now();
-    debug_print(&format!("Time after processing: {:?}", after_processing));
+    let output = global_map.par_iter()
+        .map(|(city, stats)| {
+            let min = stats.min as f32 / 10.0;
+            let mean = (stats.sum as f32 / stats.count as f32) / 10.0;
+            let max = stats.max as f32 / 10.0;
+            format!("{}={:.1}/{:.1}/{:.1}", String::from_utf8_lossy(city), min, mean, max)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
 
-    let mut result = serde_json::Map::new();
-    let mut generator = reduce_results(&combined_map);
-
-    while let Some((city, stats)) = generator.resume() {
-        result.insert(city, stats);
-    }
-
-    let json_output = Value::Object(result);
-    let output_path = "weather_stations.json";
-
-    println!(
-        "Total execution time (before writing to disk): {:?}",
-        start.elapsed()
-    );
-
-    std::fs::write(
-        output_path,
-        serde_json::to_string_pretty(&json_output).unwrap(),
-    )?;
+    println!("Processing time: {:?}", elapsed.elapsed());
+    std::fs::write("weather_stations.txt", output)?;
 
     Ok(())
 }
 
-fn parse_line(line: &str) -> Option<(String, f64)> {
-    let parts: Vec<&str> = line.split(';').collect();
-    if parts.len() == 2 {
-        let city = parts[0].trim().to_string();
-        let temp = parts[1].trim().parse::<f64>().ok()?;
-        Some((city, temp))
-    } else {
+#[inline(always)]
+fn parse_temp(bytes: &[u8]) -> Option<i32> {
+    let mut sign = 1;
+    let mut i = 0;
+    let len = bytes.len();
+
+    if len == 0 {
+        return None;
+    }
+
+    if bytes[0] == b'-' {
+        sign = -1;
+        i += 1;
+        if len == 1 {
+            return None;
+        }
+    }
+
+    let mut val = 0i32;
+    let mut seen_dot = false;
+    let mut digits_after_dot = 0;
+
+    while i < len {
+        let b = bytes[i];
+        match b {
+            b'0'..=b'9' => {
+                if seen_dot {
+                    digits_after_dot += 1;
+                    if digits_after_dot > 1 {
+                        return None;
+                    }
+                }
+                val = val * 10 + (b - b'0') as i32;
+            },
+            b'.' => {
+                if seen_dot || i == 0 || i == len - 1 {
+                    return None;
+                }
+                seen_dot = true;
+            },
+            _ => return None,
+        }
+        i += 1;
+    }
+
+    if !seen_dot || digits_after_dot != 1 {
         None
+    } else {
+        Some(sign * val)
     }
 }

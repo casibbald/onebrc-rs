@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 memmap2 = "0.9"
-rayon = "1.10"
+rayon = { version = "1.10.0" }
 dashmap = "5.5"
 rustc-hash = "1.1"
-memchr = "2.7"

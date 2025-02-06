@@ -1,170 +1,213 @@
+#![feature(asm_const)]
+#![feature(portable_simd)]
+
+use std::arch::asm;
 use dashmap::DashMap;
-use generator::{Generator, Gn, done};
 use memmap2::Mmap;
 use rayon::prelude::*;
-use serde_json::{Value, json};
-use std::env;
 use std::fs::File;
-use std::io;
 use std::time::Instant;
+// use std::ptr;
+use std::simd::u8x16;
+use std::sync::Arc;
 
-fn calculate_mean(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        0.0
-    } else {
-        let sum: f64 = values.iter().sum();
-        let mean = sum / values.len() as f64;
-        (mean * 10.0).ceil() / 10.0
-    }
+#[derive(Default, Clone)]
+struct Stats {
+    min: i32,
+    max: i32,
+    sum: i64,
+    count: u32,
 }
 
-fn chunk_lines(mmap: &[u8], start: usize, end: usize) -> Generator<'_, (), String> {
-    Gn::new_scoped(move |mut s| {
-        let mut current_pos = start;
+// ARM64 assembly implementation of critical path
+unsafe fn find_newline_neon(start: *const u8, end: *const u8) -> *const u8 {
+    let mut current = start;
 
-        if start > 0 {
-            while current_pos < end && mmap[current_pos] != b'\n' {
-                current_pos += 1;
-            }
-            current_pos += 1;
-        }
-
-        while current_pos < end {
-            let line_start = current_pos;
-            while current_pos < end && mmap[current_pos] != b'\n' {
-                current_pos += 1;
-            }
-
-            let line = String::from_utf8_lossy(&mmap[line_start..current_pos]).to_string();
-            s.yield_with(line);
-
-            current_pos += 1;
-        }
-        done!()
-    })
-}
-
-fn process_chunk(mmap: &[u8], start: usize, end: usize) -> DashMap<String, Vec<f64>> {
-    let map = DashMap::new();
-    let lines = chunk_lines(mmap, start, end);
-
-    for line in lines.into_iter() {
-        if let Some((city, temp)) = parse_line(&line) {
-            map.entry(city).or_insert_with(Vec::new).push(temp);
-        }
-    }
-
-    map
-}
-
-fn reduce_results(combined_map: &DashMap<String, Vec<f64>>) -> Generator<(), (String, Value)> {
-    Gn::new_scoped(move |mut s| {
-        for entry in combined_map.iter() {
-            let city = entry.key().clone();
-            let temps = entry.value().clone();
-
-            if !temps.is_empty() {
-                let min = temps.iter().cloned().fold(f64::INFINITY, f64::min);
-                let max = temps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let mean = calculate_mean(&temps);
-
-                s.yield_with((city, json!({ "Min": min, "Mean": mean, "Max": max })));
-            }
-        }
-        done!();
-    })
-}
-
-fn main() -> io::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    let debug = args.contains(&"--debug".to_string());
-    let file_path = args.iter().find(|arg| arg.starts_with("--file=")).map_or(
-        "data/measurements.txt".to_string(),
-        |arg| {
-            arg.split('=')
-                .nth(1)
-                .unwrap_or("data/measurements.txt")
-                .to_string()
-        },
+    asm!(
+    "1:",
+    "ld1 {{v0.16b}}, [{current}]",
+    "cmeq v1.16b, v0.16b, {newline}",
+    "umaxv b2, v1.16b",
+    "fmov {mask:w}, s2",
+    "cbnz {mask}, 2f",
+    "add {current}, {current}, 16",
+    "cmp {current}, {end}",
+    "b.lo 1b",
+    "b 3f",
+    "2:",
+    "rbit {mask}, {mask}",
+    "clz {mask}, {mask}",
+    "add {current}, {current}, {mask}",
+    "3:",
+    newline = in(vreg) u8x16::splat(b'\n'),
+    current = inout(reg) current => _,
+    end = in(reg) end,
+    mask = out(reg) _,
+    options(nostack, preserves_flags)
     );
 
-    let debug_print = |message: &str| {
-        if debug {
-            println!("{}", message);
-        }
-    };
+    current
+}
 
-    let file = File::open(&file_path)?;
-    let file_size = file.metadata()?.len() as usize;
+unsafe fn parse_temperature_asm(ptr: *const u8) -> i32 {
+    let mut temp = 0i32;
+    let mut sign = 1i32;
+    let mut dot_pos = 0usize;
 
+    asm!(
+    "// Sign check",
+    "ldrb {sign:w}, [{ptr}]",
+    "cmp {sign}, '-'",
+    "csel {sign}, {neg_one}, {one}, eq",
+    "cinc {ptr}, {ptr}, eq",
+
+    "// NEON validation",
+    "ld1 {{v0.16b}}, [{ptr}]",
+    "sub v1.16b, v0.16b, {ascii_zero}",
+    "cmgt v2.16b, v1.16b, {nine}",
+    "umaxv b3, v2.16b",
+    "fmov {mask:w}, s3",
+    "cbnz {mask}, 2f",
+
+    "// Integer parsing",
+    "mov {dot_pos}, 0",
+    "1:",
+    "ldrb {char:w}, [{ptr}, {dot_pos}]",
+    "cmp {char}, '.'",
+    "b.eq 3f",
+    "sub {char}, {char}, '0'",
+    "madd {temp}, {temp}, {ten}, {char}",
+    "add {dot_pos}, {dot_pos}, 1",
+    "b 1b",
+
+    "3:",
+    "add {ptr}, {ptr}, {dot_pos}",
+    "ldrb {char:w}, [{ptr}, 1]",
+    "sub {char}, {char}, '0'",
+    "madd {temp}, {temp}, {ten}, {char}",
+    "mul {temp}, {temp}, {sign}",
+    "b 4f",
+
+    "2:",
+    "mov {temp}, 0",
+    "4:",
+    ptr = inout(reg) ptr => _,
+    sign = inout(reg) sign,
+    temp = inout(reg) temp,
+    dot_pos = out(reg) dot_pos,
+    char = out(reg) _,
+    ascii_zero = in(vreg) u8x16::splat(b'0'),
+    nine = in(vreg) u8x16::splat(9),
+    ten = in(reg) 10i32,
+    one = in(reg) 1i32,
+    neg_one = in(reg) -1i32,
+    mask = out(reg) _,
+    options(nostack, preserves_flags)
+    );
+
+    temp
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::open("data/measurements.txt")?;
     let mmap = unsafe { Mmap::map(&file)? };
+    let data = Arc::new(mmap.as_ptr());
+    let len = mmap.len();
 
     let start = Instant::now();
-    debug_print(&format!("Start time: {:?}", start));
 
-    let num_cpus = num_cpus::get_physical();
-    let chunk_size = file_size / num_cpus;
+    let result = DashMap::new();
+    let num_threads = rayon::current_num_threads();
+    let chunk_size = (len + num_threads - 1) / num_threads;
 
-    debug_print(&format!("File size: {} bytes", file_size));
-    debug_print(&format!("Number of processors: {}", num_cpus));
-    debug_print(&format!("Chunk size: {} bytes", chunk_size));
+    (0..num_threads).into_par_iter().for_each(|i| {
+        let data = Arc::clone(&data);
+        let mut local_map = DashMap::new();
+        let start_ptr = unsafe { data.add(i * chunk_size) };
+        let end_ptr = unsafe { data.add((i + 1) * chunk_size).min(data.add(len)) };
 
-    let results: Vec<_> = (0..num_cpus)
-        .into_par_iter()
-        .map(|i| {
-            let start = i * chunk_size;
-            let end = if i == num_cpus - 1 {
-                file_size
-            } else {
-                (i + 1) * chunk_size
-            };
-            process_chunk(&mmap, start, end)
-        })
-        .collect();
-
-    let combined_map = DashMap::new();
-    for map in results {
-        for entry in map.iter() {
-            combined_map
-                .entry(entry.key().clone())
-                .or_insert_with(Vec::new)
-                .extend(entry.value().clone());
+        let mut ptr = start_ptr;
+        if i != 0 {
+            // Align to line start
+            while ptr < end_ptr && unsafe { *ptr } != b'\n' {
+                ptr = unsafe { ptr.add(1) };
+            }
+            ptr = unsafe { ptr.add(1) };
         }
-    }
 
-    let after_processing = Instant::now();
-    debug_print(&format!("Time after processing: {:?}", after_processing));
+        while ptr < end_ptr {
+            let line_start = ptr;
+            let line_end = unsafe { find_newline_neon(ptr, end_ptr) };
 
-    let mut result = serde_json::Map::new();
-    let mut generator = reduce_results(&combined_map);
+            // Find semicolon using same NEON pattern
+            let mut semi = line_start;
+            while semi < line_end {
+                let chunk = unsafe { std::slice::from_raw_parts(semi, 16.min(line_end as usize - semi as usize)) };
+                if let Some(pos) = chunk.iter().position(|&b| b == b';') {
+                    semi = unsafe { semi.add(pos) };
+                    break;
+                }
+                semi = unsafe { semi.add(16) };
+            }
 
-    while let Some((city, stats)) = generator.resume() {
-        result.insert(city, stats);
-    }
+            if semi >= line_end {
+                ptr = unsafe { line_end.add(1) };
+                continue;
+            }
 
-    let json_output = Value::Object(result);
-    let output_path = "weather_stations.json";
+            // Parse temperature with assembly
+            let temp = unsafe { parse_temperature_asm(semi.add(1)) };
 
-    println!(
-        "Total execution time (before writing to disk): {:?}",
-        start.elapsed()
-    );
+            // Update stats
+            let city = unsafe { std::slice::from_raw_parts(line_start, semi as usize - line_start as usize) };
+            local_map.entry(city.to_vec())
+                .and_modify(|s: &mut Stats| {
 
-    std::fs::write(
-        output_path,
-        serde_json::to_string_pretty(&json_output).unwrap(),
-    )?;
+                    s.min = s.min.min(temp);
+                    s.max = s.max.max(temp);
+                    s.sum += temp as i64;
+                    s.count += 1;
+                })
+                .or_insert(Stats {
+                    min: temp,
+                    max: temp,
+                    sum: temp as i64,
+                    count: 1,
+                });
+
+            ptr = unsafe { line_end.add(1) };
+        }
+
+        // Merge results
+        for (city, stats) in local_map {
+            result.entry(city)
+                .and_modify(|s: &mut Stats| {
+                    s.min = s.min.min(stats.min);
+                    s.max = s.max.max(stats.max);
+                    s.sum += stats.sum;
+                    s.count += stats.count;
+                })
+                .or_insert(stats);
+        }
+    });
+
+    // Generate output
+    let mut results: Vec<_> = result.into_iter().collect();
+    results.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    let output = results.into_par_iter()
+        .map(|(city, stats)| {
+            let city = String::from_utf8_lossy(&city).to_string();
+            let min = stats.min as f32 / 10.0;
+            let mean = (stats.sum as f32 / stats.count as f32) / 10.0;
+            let max = stats.max as f32 / 10.0;
+            format!("{}={:.1}/{:.1}/{:.1}", city, min, mean, max)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    println!("Processing time: {:?}", start.elapsed());
+    std::fs::write("weather_stations.txt", output)?;
 
     Ok(())
-}
-
-fn parse_line(line: &str) -> Option<(String, f64)> {
-    let parts: Vec<&str> = line.split(';').collect();
-    if parts.len() == 2 {
-        let city = parts[0].trim().to_string();
-        let temp = parts[1].trim().parse::<f64>().ok()?;
-        Some((city, temp))
-    } else {
-        None
-    }
 }

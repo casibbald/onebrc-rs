@@ -6,10 +6,11 @@ use dashmap::DashMap;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fs::File;
+use std::ops::Add;
 use std::time::Instant;
 // use std::ptr;
 use std::simd::u8x16;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Default, Clone)]
 struct Stats {
@@ -49,7 +50,7 @@ unsafe fn find_newline_neon(start: *const u8, end: *const u8) -> *const u8 {
     current
 }
 
-unsafe fn parse_temperature_asm(ptr: *const u8) -> i32 {
+unsafe fn parse_temperature_asm(ptr: u8) -> i32 {
     let mut temp = 0i32;
     let mut sign = 1i32;
     let mut dot_pos = 0usize;
@@ -111,7 +112,7 @@ unsafe fn parse_temperature_asm(ptr: *const u8) -> i32 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open("data/measurements.txt")?;
     let mmap = unsafe { Mmap::map(&file)? };
-    let data = Arc::new(mmap.as_ptr());
+    let data = Arc::new(Mutex::new(mmap.as_ptr()));
     let len = mmap.len();
 
     let start = Instant::now();
@@ -120,46 +121,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let num_threads = rayon::current_num_threads();
     let chunk_size = (len + num_threads - 1) / num_threads;
 
-    (0..num_threads).into_par_iter().for_each(|i| {
+    (0..num_threads).into_par_iter().for_each(|i| unsafe {
         let data = Arc::clone(&data);
         let mut local_map = DashMap::new();
-        let start_ptr = unsafe { data.add(i * chunk_size) };
-        let end_ptr = unsafe { data.add((i + 1) * chunk_size).min(data.add(len)) };
+        let start_ptr = unsafe { *data.lock().unwrap().add(i * chunk_size) };
+        let end_ptr = unsafe { *data.lock().unwrap().add((i + 1) * chunk_size).min(data.lock().unwrap().add(len)) };
 
         let mut ptr = start_ptr;
         if i != 0 {
             // Align to line start
-            while ptr < end_ptr && unsafe { *ptr } != b'\n' {
-                ptr = unsafe { ptr.add(1) };
+            while ptr < end_ptr && { ptr } != b'\n' {
+                ptr = ptr.add(1);
             }
-            ptr = unsafe { ptr.add(1) };
+            ptr = ptr.add(1);
         }
 
         while ptr < end_ptr {
             let line_start = ptr;
-            let line_end = unsafe { find_newline_neon(ptr, end_ptr) };
+            let line_end = { find_newline_neon(*ptr, *end_ptr) };
 
             // Find semicolon using same NEON pattern
             let mut semi = line_start;
-            while semi < line_end {
-                let chunk = unsafe { std::slice::from_raw_parts(semi, 16.min(line_end as usize - semi as usize)) };
+            while semi < *line_end {
+                let chunk =  { std::slice::from_raw_parts(*semi, 16.min(*line_end as usize - *semi as usize)) };
                 if let Some(pos) = chunk.iter().position(|&b| b == b';') {
-                    semi = unsafe { semi.add(pos) };
+                    semi = unsafe { semi.add(&pos) };
                     break;
                 }
                 semi = unsafe { semi.add(16) };
             }
 
-            if semi >= line_end {
-                ptr = unsafe { line_end.add(1) };
+            if semi >= *line_end {
+                ptr = unsafe { *line_end.add(1) };
                 continue;
             }
 
             // Parse temperature with assembly
-            let temp = unsafe { parse_temperature_asm(semi.add(1)) };
+            let temp =  { parse_temperature_asm(*semi.add(1)) };
 
             // Update stats
-            let city = unsafe { std::slice::from_raw_parts(line_start, semi as usize - line_start as usize) };
+            let city = { std::slice::from_raw_parts(*line_start, *semi as usize - *line_start as usize) };
             local_map.entry(city.to_vec())
                 .and_modify(|s: &mut Stats| {
 
@@ -175,7 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     count: 1,
                 });
 
-            ptr = unsafe { line_end.add(1) };
+            ptr = unsafe { *line_end.add(1) };
         }
 
         // Merge results
